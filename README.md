@@ -3,6 +3,8 @@
 > 把你的 iPhone 变成 Mac 的无线麦克风，支持 Codex 语音输入、语音识别等场景。
 > Turn your iPhone into a wireless microphone for your Mac.
 
+![Interface](screenshot.png)
+
 ## 概述 / Overview
 
 Mac Mini 没有内置麦克风？没关系。这个项目让你用 **iPhone 的麦克风** 通过 Wi-Fi 实时传输音频到 Mac，并且通过 **BlackHole 虚拟音频驱动** 注册为系统级输入设备——所有 Mac 应用都可以直接使用。
@@ -76,6 +78,7 @@ iphone-mic/
 ├── static/
 │   └── index.html     # iPhone 端网页（音频采集 + Wake Lock）
 ├── bh_player.swift    # Swift 播放器（直接输出到 BlackHole）
+├── screenshot.png     # 软件界面截图
 ├── cert.pem           # HTTPS 自签名证书
 ├── key.pem            # 证书私钥
 └── cert.conf          # 证书配置（含 SAN）
