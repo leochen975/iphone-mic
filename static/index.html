@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>iPhone 麦克风</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  background: #1a1a2e;
+  color: #eee;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-height: 100vh;
+  text-align: center;
+  padding: 20px;
+}
+.container { max-width: 400px; width: 100%; }
+h1 { font-size: 1.6rem; margin-bottom: 8px; }
+.subtitle { color: #888; font-size: 0.9rem; margin-bottom: 30px; }
+.mic-btn {
+  width: 140px; height: 140px;
+  border-radius: 70px;
+  border: none;
+  background: linear-gradient(145deg, #e94560, #c23152);
+  color: #fff;
+  font-size: 3.5rem;
+  cursor: pointer;
+  transition: all 0.3s;
+  margin-bottom: 20px;
+  touch-action: manipulation;
+  box-shadow: 0 8px 25px rgba(233, 69, 96, 0.3);
+}
+.mic-btn:active { transform: scale(0.95); }
+.mic-btn.active {
+  background: linear-gradient(145deg, #0f3460, #16213e);
+  box-shadow: 0 0 50px rgba(233, 69, 96, 0.6);
+  animation: pulse 1.5s infinite;
+}
+@keyframes pulse {
+  0% { box-shadow: 0 0 20px rgba(233,69,96,0.4); }
+  50% { box-shadow: 0 0 70px rgba(233,69,96,0.8); }
+  100% { box-shadow: 0 0 20px rgba(233,69,96,0.4); }
+}
+.status { font-size: 0.9rem; color: #aaa; margin-bottom: 16px; min-height: 1.2em; }
+.status.error { color: #e94560; }
+.status.ok { color: #4ecca3; }
+.volume-meter {
+  width: 100%; height: 8px; background: #333; border-radius: 4px; overflow: hidden;
+  margin: 16px 0; opacity: 0; transition: opacity 0.3s;
+}
+.volume-meter.active { opacity: 1; }
+.volume-meter-fill {
+  height: 100%; width: 0%;
+  background: linear-gradient(90deg, #4ecca3, #e94560);
+  transition: width 0.08s;
+  border-radius: 4px;
+}
+.latency { color: #666; font-size: 0.75rem; margin-bottom: 12px; }
+.tip { color: #555; font-size: 0.8rem; line-height: 1.5; }
+.wake-tip { color: #f0c040; font-size: 0.75rem; margin-top: 4px; display: none; }
+.debug { margin-top: 16px; font-size: 0.65rem; color: #444; word-break: break-all; max-height: 80px; overflow-y: auto; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>iPhone 麦克风</h1>
+  <p class="subtitle">将你的 iPhone 变成 Mac 的无线麦克风</p>
+  <button class="mic-btn" id="micBtn">🎤</button>
+  <div class="status" id="status">点击按钮开始</div>
+  <div class="volume-meter" id="volumeMeter">
+    <div class="volume-meter-fill" id="volumeFill"></div>
+  </div>
+  <div class="latency" id="latency"></div>
+  <p class="tip">点击按钮后允许麦克风权限<br>对着 iPhone 说话</p>
+  <p class="wake-tip" id="wakeTip">🔒 屏幕常亮已启用，息屏不会中断</p>
+  <pre class="debug" id="debug"></pre>
+</div>
+
+<script>
+// ========== Wake Lock ==========
+let wakeLock = null;
+
+async function requestWakeLock() {
+  try {
+    if ('wakeLock' in navigator) {
+      wakeLock = await navigator.wakeLock.request('screen');
+      wakeLock.addEventListener('release', () => {
+        // Auto-reacquire if we're still streaming
+        if (isStreaming) requestWakeLock();
+      });
+      document.getElementById('wakeTip').style.display = 'block';
+    }
+  } catch (err) {
+    // Wake Lock not supported or denied - that's OK
+  }
+}
+
+async function releaseWakeLock() {
+  if (wakeLock) {
+    try {
+      await wakeLock.release();
+      wakeLock = null;
+      document.getElementById('wakeTip').style.display = 'none';
+    } catch(e) {}
+  }
+}
+
+// Re-acquire wake lock if page becomes visible again
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && isStreaming) {
+    requestWakeLock();
+  }
+});
+
+// ========== Audio Streaming ==========
+const micBtn = document.getElementById('micBtn');
+const statusEl = document.getElementById('status');
+const volumeFill = document.getElementById('volumeFill');
+const volumeMeter = document.getElementById('volumeMeter');
+const latencyEl = document.getElementById('latency');
+const debugEl = document.getElementById('debug');
+
+let stream = null;
+let isStreaming = false;
+let audioContext = null;
+let scriptNode = null;
+let sessionId = null;
+let sendTimer = null;
+let sendBuffer = [];
+
+function log(msg) {
+  debugEl.textContent = new Date().toLocaleTimeString() + ' ' + msg + '\n' + debugEl.textContent;
+  if (debugEl.textContent.length > 500) {
+    debugEl.textContent = debugEl.textContent.substring(0, 500);
+  }
+}
+
+function sendAudioData(pcmData) {
+  sendBuffer.push(pcmData);
+}
+
+async function flushAudio() {
+  if (sendBuffer.length === 0) return;
+  const chunks = sendBuffer;
+  sendBuffer = [];
+
+  const totalLen = chunks.reduce((s, c) => s + c.byteLength, 0);
+  const combined = new Uint8Array(totalLen);
+  let offset = 0;
+  for (const chunk of chunks) {
+    combined.set(new Uint8Array(chunk), offset);
+    offset += chunk.byteLength;
+  }
+
+  try {
+    const t0 = performance.now();
+    const resp = await fetch('/audio', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/octet-stream',
+        'X-Session-Id': sessionId,
+      },
+      body: combined.buffer,
+    });
+    const latency = Math.round(performance.now() - t0);
+    latencyEl.textContent = '延迟: ' + latency + ' ms';
+    if (!resp.ok) log('发送失败: HTTP ' + resp.status);
+  } catch (err) {
+    log('发送错误: ' + err.message);
+  }
+}
+
+async function startStreaming() {
+  try {
+    log('请求麦克风权限...');
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        sampleRate: 44100,
+        channelCount: 1
+      }
+    });
+    log('麦克风已授权');
+
+    // Acquire wake lock to keep screen on
+    await requestWakeLock();
+
+    sessionId = Date.now() + '-' + Math.random().toString(36).substr(2, 9);
+
+    audioContext = new AudioContext({ sampleRate: 44100 });
+    const source = audioContext.createMediaStreamSource(stream);
+
+    const bufferSize = 4096;
+    scriptNode = audioContext.createScriptProcessor(bufferSize, 1, 1);
+
+    scriptNode.onaudioprocess = (event) => {
+      if (!isStreaming) return;
+      const input = event.inputBuffer.getChannelData(0);
+
+      let sum = 0;
+      for (let i = 0; i < input.length; i++) sum += Math.abs(input[i]);
+      const vol = Math.min(sum / input.length * 5, 1);
+      volumeFill.style.width = (vol * 100) + '%';
+      volumeMeter.className = 'volume-meter active';
+
+      const pcmData = new Int16Array(input.length);
+      for (let i = 0; i < input.length; i++) {
+        const s = Math.max(-1, Math.min(1, input[i]));
+        pcmData[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+      }
+      sendAudioData(pcmData.buffer);
+    };
+
+    source.connect(scriptNode);
+    scriptNode.connect(audioContext.destination);
+
+    sendTimer = setInterval(flushAudio, 200);
+
+    isStreaming = true;
+    micBtn.textContent = 'Stop';
+    micBtn.className = 'mic-btn active';
+    statusEl.textContent = '正在传输音频到 Mac...';
+    statusEl.className = 'status ok';
+    log('音频传输中');
+  } catch (err) {
+    statusEl.textContent = '麦克风错误: ' + err.message;
+    statusEl.className = 'status error';
+    log('错误: ' + err.message);
+  }
+}
+
+async function stopStreaming() {
+  isStreaming = false;
+
+  // Release wake lock
+  await releaseWakeLock();
+
+  if (sendTimer) { clearInterval(sendTimer); sendTimer = null; }
+  await flushAudio();
+
+  try {
+    await fetch('/stop', { method: 'POST', headers: { 'X-Session-Id': sessionId } });
+  } catch(e) {}
+
+  if (scriptNode) { scriptNode.disconnect(); scriptNode = null; }
+  if (audioContext) { audioContext.close(); audioContext = null; }
+  if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+
+  sendBuffer = [];
+  sessionId = null;
+  micBtn.textContent = 'Mic';
+  micBtn.className = 'mic-btn';
+  statusEl.textContent = '已停止';
+  volumeMeter.className = 'volume-meter';
+  log('已停止传输');
+}
+
+micBtn.addEventListener('click', () => {
+  if (isStreaming) stopStreaming();
+  else startStreaming();
+});
+</script>
+</body>
+</html>
